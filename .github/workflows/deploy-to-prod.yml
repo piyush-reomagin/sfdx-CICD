@@ -1,0 +1,40 @@
+name: Deploy Metadata to Production
+
+# 1. Define when this workflow runs
+on:
+  push:
+    branches:
+      - main # Change this if your main branch has a different name (e.g., master)
+    paths:
+      - 'force-app/**' # Only trigger if files in the Salesforce app folder change
+
+# 2. Define the jobs to run
+jobs:
+  deploy-to-prod:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 3. Check out the source code
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 4. Install Node.js (required for Salesforce CLI)
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 5. Install the Salesforce CLI
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli
+
+      # 6. Authenticate to the Production Org
+      - name: Authenticate to Salesforce
+        run: |
+          echo "${{ secrets.SF_PROD_AUTH_URL }}" > authFile.txt
+          sf org login sfdx-url -f authFile.txt --set-default --alias PreProd-ReoGen
+          rm authFile.txt # Clean up the file for security
+
+      # 7. Deploy to Production and Run Tests
+      - name: Deploy Source to Prod
+        run: sf project deploy start --source-dir force-app --target-org PreProd-ReoGen --test-level RunLocalTests --wait 30
