@@ -1,40 +1,318 @@
 name: Deploy Metadata to Production
-
-# 1. Define when this workflow runs
+ 
+# ─────────────────────────────────────────────
+# TRIGGERS
+# ─────────────────────────────────────────────
 on:
+  # Auto: runs on push to main when Salesforce files change
   push:
     branches:
-      - main # Change this if your main branch has a different name (e.g., master)
+      - main
     paths:
-      - 'force-app/**' # Only trigger if files in the Salesforce app folder change
-
-# 2. Define the jobs to run
+      - 'force-app/**'
+ 
+  # Manual: run from GitHub Actions UI with options
+  workflow_dispatch:
+    inputs:
+      test_level:
+        description: 'Test level to use for deployment'
+        required: true
+        default: 'RunLocalTests'
+        type: choice
+        options:
+          - RunLocalTests
+          - RunAllTestsInOrg
+          - RunSpecifiedTests
+      specified_tests:
+        description: 'Comma-separated test class names (only used if RunSpecifiedTests is selected)'
+        required: false
+        default: ''
+      coverage_threshold:
+        description: 'Minimum code coverage % required (default: 75)'
+        required: false
+        default: '75'
+      dry_run:
+        description: 'Validate only (no actual deployment)?'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+ 
+# ─────────────────────────────────────────────
+# ENVIRONMENT DEFAULTS
+# ─────────────────────────────────────────────
+env:
+  # Used when triggered by push (workflow_dispatch overrides these via inputs)
+  DEFAULT_TEST_LEVEL: RunLocalTests
+  DEFAULT_COVERAGE_THRESHOLD: 75
+ 
 jobs:
   deploy-to-prod:
     runs-on: ubuntu-latest
-
+ 
     steps:
-      # 3. Check out the source code
+      # ── 1. Checkout ──────────────────────────────
       - name: Checkout Code
         uses: actions/checkout@v4
-
-      # 4. Install Node.js (required for Salesforce CLI)
+ 
+      # ── 2. Node.js ───────────────────────────────
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-
-      # 5. Install the Salesforce CLI
+ 
+      # ── 3. Salesforce CLI ────────────────────────
       - name: Install Salesforce CLI
         run: npm install -g @salesforce/cli
-
-      # 6. Authenticate to the Production Org
+ 
+      # ── 4. Authenticate ──────────────────────────
       - name: Authenticate to Salesforce
         run: |
           echo "${{ secrets.SF_PROD_AUTH_URL }}" > authFile.txt
           sf org login sfdx-url -f authFile.txt --set-default --alias PreProd-ReoGen
-          rm authFile.txt # Clean up the file for security
-
-      # 7. Deploy to Production and Run Tests
-      - name: Deploy Source to Prod
-        run: sf project deploy start --source-dir force-app --target-org PreProd-ReoGen --test-level RunLocalTests --wait 30
+          rm authFile.txt
+ 
+      # ── 5. Resolve inputs (push vs manual) ───────
+      - name: Resolve deployment parameters
+        id: params
+        run: |
+          # Test level
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TEST_LEVEL="${{ github.event.inputs.test_level }}"
+            THRESHOLD="${{ github.event.inputs.coverage_threshold }}"
+            DRY_RUN="${{ github.event.inputs.dry_run }}"
+          else
+            TEST_LEVEL="${{ env.DEFAULT_TEST_LEVEL }}"
+            THRESHOLD="${{ env.DEFAULT_COVERAGE_THRESHOLD }}"
+            DRY_RUN="false"
+          fi
+ 
+          echo "test_level=$TEST_LEVEL"       >> $GITHUB_OUTPUT
+          echo "threshold=$THRESHOLD"         >> $GITHUB_OUTPUT
+          echo "dry_run=$DRY_RUN"             >> $GITHUB_OUTPUT
+ 
+          # Build the --tests flag only when RunSpecifiedTests is chosen
+          SPECIFIED="${{ github.event.inputs.specified_tests }}"
+          if [ "$TEST_LEVEL" = "RunSpecifiedTests" ] && [ -n "$SPECIFIED" ]; then
+            echo "tests_flag=--tests $SPECIFIED" >> $GITHUB_OUTPUT
+          else
+            echo "tests_flag="                   >> $GITHUB_OUTPUT
+          fi
+ 
+          echo ""
+          echo "=========================================="
+          echo " Deployment parameters"
+          echo "  Trigger     : ${{ github.event_name }}"
+          echo "  Test level  : $TEST_LEVEL"
+          echo "  Coverage    : >= $THRESHOLD %"
+          echo "  Dry run     : $DRY_RUN"
+          echo "=========================================="
+ 
+      # ── 6. Deploy (or validate-only) ─────────────
+      - name: Deploy / Validate Source
+        id: deploy
+        run: |
+          DRY_RUN="${{ steps.params.outputs.dry_run }}"
+          TEST_LEVEL="${{ steps.params.outputs.test_level }}"
+          TESTS_FLAG="${{ steps.params.outputs.tests_flag }}"
+ 
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "▶ Validate-only mode (no changes will be deployed)"
+            DEPLOY_CMD="sf project deploy validate"
+          else
+            DEPLOY_CMD="sf project deploy start"
+          fi
+ 
+          # Run deployment and capture JSON output for coverage parsing
+          $DEPLOY_CMD \
+            --source-dir force-app \
+            --target-org PreProd-ReoGen \
+            --test-level "$TEST_LEVEL" \
+            $TESTS_FLAG \
+            --wait 30 \
+            --json \
+            --coverage-formatters text \
+            --results-dir ./deploy-results \
+            | tee deploy-output.json
+ 
+          DEPLOY_EXIT=${PIPESTATUS[0]}
+          echo "deploy_exit=$DEPLOY_EXIT" >> $GITHUB_OUTPUT
+          exit $DEPLOY_EXIT
+ 
+      # ── 7. Coverage enforcement ───────────────────
+      # Runs even if deploy step fails so we always get a report
+      - name: Enforce coverage threshold & generate report
+        if: always()
+        id: coverage
+        run: |
+          THRESHOLD="${{ steps.params.outputs.threshold }}"
+          REPORT_FILE="./deploy-results/coverage/text/index.txt"
+          SUMMARY_FILE="coverage-summary.md"
+ 
+          echo "## 📊 Salesforce Test Coverage Report" > $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+          echo "**Trigger:** \`${{ github.event_name }}\` | **Branch:** \`${{ github.ref_name }}\` | **Threshold:** \`${THRESHOLD}%\`" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+ 
+          # ── Parse coverage from deploy JSON output ──
+          COVERAGE_JSON="deploy-output.json"
+          FAILED_CLASSES=""
+          BELOW_THRESHOLD=0
+          TOTAL_CLASSES=0
+          PASSING_CLASSES=0
+ 
+          if [ -f "$COVERAGE_JSON" ]; then
+            # Extract per-class coverage using jq
+            # The result JSON path: result.details.runTestResult.codeCoverage
+            CLASS_COVERAGE=$(cat $COVERAGE_JSON | jq -r '
+              .result.details.runTestResult.codeCoverage // [] |
+              .[] |
+              "\(.name)|\(.numLocations)|\(.numLocationsNotCovered)"
+            ' 2>/dev/null || echo "")
+ 
+            if [ -n "$CLASS_COVERAGE" ]; then
+              echo "### Per-class coverage" >> $SUMMARY_FILE
+              echo "" >> $SUMMARY_FILE
+              echo "| Class | Lines | Covered | Coverage | Status |" >> $SUMMARY_FILE
+              echo "|-------|-------|---------|----------|--------|" >> $SUMMARY_FILE
+ 
+              while IFS='|' read -r CLASS_NAME TOTAL_LINES NOT_COVERED; do
+                [ -z "$CLASS_NAME" ] && continue
+                TOTAL_CLASSES=$((TOTAL_CLASSES + 1))
+ 
+                if [ "$TOTAL_LINES" -gt 0 ] 2>/dev/null; then
+                  COVERED=$(( TOTAL_LINES - NOT_COVERED ))
+                  PCT=$(( (COVERED * 100) / TOTAL_LINES ))
+                else
+                  PCT=100
+                  COVERED=0
+                  TOTAL_LINES=0
+                fi
+ 
+                if [ "$PCT" -lt "$THRESHOLD" ]; then
+                  STATUS="❌ BELOW"
+                  FAILED_CLASSES="$FAILED_CLASSES\n  • $CLASS_NAME: ${PCT}% (needs ${THRESHOLD}%)"
+                  BELOW_THRESHOLD=$((BELOW_THRESHOLD + 1))
+                else
+                  STATUS="✅ OK"
+                  PASSING_CLASSES=$((PASSING_CLASSES + 1))
+                fi
+ 
+                echo "| \`$CLASS_NAME\` | $TOTAL_LINES | $COVERED | ${PCT}% | $STATUS |" >> $SUMMARY_FILE
+              done <<< "$CLASS_COVERAGE"
+ 
+              echo "" >> $SUMMARY_FILE
+            fi
+ 
+            # ── Overall org coverage ──
+            ORG_COVERAGE=$(cat $COVERAGE_JSON | jq -r '
+              .result.details.runTestResult.codeCoverageWarnings // [] |
+              map(select(.name == "Average")) | .[0].message // ""
+            ' 2>/dev/null || echo "")
+ 
+            # Fallback: calculate from totals
+            TOTAL_OVERALL=$(cat $COVERAGE_JSON | jq '[.result.details.runTestResult.codeCoverage // [] | .[].numLocations] | add // 0' 2>/dev/null || echo 0)
+            NOT_COVERED_OVERALL=$(cat $COVERAGE_JSON | jq '[.result.details.runTestResult.codeCoverage // [] | .[].numLocationsNotCovered] | add // 0' 2>/dev/null || echo 0)
+ 
+            if [ "$TOTAL_OVERALL" -gt 0 ] 2>/dev/null; then
+              COVERED_OVERALL=$(( TOTAL_OVERALL - NOT_COVERED_OVERALL ))
+              ORG_PCT=$(( (COVERED_OVERALL * 100) / TOTAL_OVERALL ))
+            else
+              ORG_PCT="N/A"
+            fi
+ 
+            # ── Test results summary ──
+            TESTS_RAN=$(cat $COVERAGE_JSON | jq '.result.details.runTestResult.numTestsRan // 0' 2>/dev/null || echo 0)
+            TESTS_FAILED=$(cat $COVERAGE_JSON | jq '.result.details.runTestResult.numFailures // 0' 2>/dev/null || echo 0)
+            TESTS_PASSED=$(( TESTS_RAN - TESTS_FAILED ))
+ 
+            echo "### Summary" >> $SUMMARY_FILE
+            echo "" >> $SUMMARY_FILE
+            echo "| Metric | Value |" >> $SUMMARY_FILE
+            echo "|--------|-------|" >> $SUMMARY_FILE
+            echo "| Tests ran | $TESTS_RAN |" >> $SUMMARY_FILE
+            echo "| Tests passed | ✅ $TESTS_PASSED |" >> $SUMMARY_FILE
+            echo "| Tests failed | $([ $TESTS_FAILED -gt 0 ] && echo "❌ $TESTS_FAILED" || echo "✅ 0") |" >> $SUMMARY_FILE
+            echo "| Classes checked | $TOTAL_CLASSES |" >> $SUMMARY_FILE
+            echo "| Classes below threshold | $([ $BELOW_THRESHOLD -gt 0 ] && echo "❌ $BELOW_THRESHOLD" || echo "✅ 0") |" >> $SUMMARY_FILE
+            echo "| Overall org coverage | ${ORG_PCT}% |" >> $SUMMARY_FILE
+            echo "" >> $SUMMARY_FILE
+ 
+            # ── Failed test details ──
+            FAILED_TESTS=$(cat $COVERAGE_JSON | jq -r '
+              .result.details.runTestResult.failures // [] |
+              .[] | "• \(.name).\(.methodName): \(.message)"
+            ' 2>/dev/null || echo "")
+ 
+            if [ -n "$FAILED_TESTS" ]; then
+              echo "### ❌ Failed test methods" >> $SUMMARY_FILE
+              echo "" >> $SUMMARY_FILE
+              echo '```' >> $SUMMARY_FILE
+              echo "$FAILED_TESTS" >> $SUMMARY_FILE
+              echo '```' >> $SUMMARY_FILE
+              echo "" >> $SUMMARY_FILE
+            fi
+          else
+            echo "⚠️  deploy-output.json not found — coverage data unavailable." >> $SUMMARY_FILE
+          fi
+ 
+          # ── Classes below threshold ──
+          if [ $BELOW_THRESHOLD -gt 0 ]; then
+            echo "### ❌ Classes below ${THRESHOLD}% threshold" >> $SUMMARY_FILE
+            echo "" >> $SUMMARY_FILE
+            echo '```' >> $SUMMARY_FILE
+            printf "$FAILED_CLASSES\n" >> $SUMMARY_FILE
+            echo '```' >> $SUMMARY_FILE
+            echo "" >> $SUMMARY_FILE
+            echo "> Increase test coverage for the classes above and re-run the workflow." >> $SUMMARY_FILE
+          else
+            echo "### ✅ All classes meet the ${THRESHOLD}% coverage threshold" >> $SUMMARY_FILE
+          fi
+ 
+          # ── Print to Actions log ──
+          echo ""
+          cat $SUMMARY_FILE
+          echo ""
+ 
+          # ── Write to GitHub step summary ──
+          cat $SUMMARY_FILE >> $GITHUB_STEP_SUMMARY
+ 
+          # ── Fail the job if any class is below threshold ──
+          if [ $BELOW_THRESHOLD -gt 0 ]; then
+            echo ""
+            echo "❌ $BELOW_THRESHOLD class(es) below the ${THRESHOLD}% coverage threshold. Failing build."
+            exit 1
+          fi
+ 
+          echo "✅ All coverage checks passed."
+ 
+      # ── 8. Upload coverage artefacts ─────────────
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-${{ github.run_number }}
+          path: |
+            deploy-results/
+            coverage-summary.md
+            deploy-output.json
+          retention-days: 30
+ 
+      # ── 9. Post PR comment (on pull requests) ─────
+      - name: Post coverage comment on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.existsSync('coverage-summary.md')
+              ? fs.readFileSync('coverage-summary.md', 'utf8')
+              : '⚠️ Coverage report not available.';
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
